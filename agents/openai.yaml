@@ -1,0 +1,4 @@
+interface:
+  display_name: "Super Search"
+  short_description: "Routed local search via super-search"
+  default_prompt: "Use $super-search to route and run a sourced search for this query."
