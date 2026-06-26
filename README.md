@@ -43,7 +43,7 @@ Super Search 的原则是：
 | URL / 链接 / 文章 | Jina Reader | 读取网页正文，避免一上来开浏览器 |
 | GitHub / 开源项目 / 仓库 | GitHub CLI + Exa | 先查仓库，再补充网页语境 |
 | 普通网页调研 | Exa | 走语义网页搜索 |
-| 公众号 / 抖音 / 小红书 / 视频号 | RedFox 提示 | 当前只提示，不自动调用付费源 |
+| 公众号 / 小红书 / B站 | RedFox 适配器 | 默认只提示；`--redfox` + `REDFOX_API_KEY` 显式启用后真正调用（付费源不静默触发） |
 | TikTok / Instagram / X / Reddit / YouTube | TikHub 提示 | 当前只提示，不自动调用付费源 |
 | 登录 / 点击 / 截图 / 下载 / 后台 | 浏览器兜底提示 | 当前只提示，需要确认后再执行 |
 
@@ -181,7 +181,7 @@ python3 scripts/super_search.py "github 上类似 Agent Reach 的项目" --dry-r
 
 - 结果质量评分
 - “结果不够”时自动降级到 Agent Reach
-- RedFox adapter
+- ~~RedFox adapter~~ ✅ 已实现（`--redfox`，opt-in 付费源）
 - TikHub adapter
 - AgentKey adapter
 - 浏览器兜底确认流程

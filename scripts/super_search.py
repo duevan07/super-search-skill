@@ -168,7 +168,7 @@ class SearchRouter:
         "浏览器",
     )
 
-    def plan(self, query: str, mode: str = "auto") -> RoutePlan:
+    def plan(self, query: str, mode: str = "auto", use_redfox: bool = False) -> RoutePlan:
         query = query.strip()
         lowered = query.lower()
         urls = extract_urls(query)
@@ -192,7 +192,11 @@ class SearchRouter:
             notes.append("通用搜索：默认走 Exa 免费语义搜索。")
 
         if any(word in lowered for word in self.chinese_media_keywords):
-            notes.append("中文新媒体深度数据建议接 RedFox；MVP 暂不自动调用付费源。")
+            if use_redfox:
+                providers.append("redfox")
+                notes.append("中文新媒体：已显式启用 RedFox 付费源（--redfox）。")
+            else:
+                notes.append("中文新媒体深度数据建议接 RedFox；加 --redfox 且设置 REDFOX_API_KEY 后启用。")
 
         if any(word in lowered for word in self.global_social_keywords):
             notes.append("全球社媒深字段建议接 TikHub；MVP 暂不自动调用付费源。")
@@ -280,21 +284,53 @@ class GitHubProvider:
         self.runner = runner
         self.timeout = timeout
 
-    def search(self, query: str, limit: int = 5) -> list[SearchResult]:
+    # `gh search repos` ANDs every term across repo metadata, so multi-word
+    # natural-language phrases (e.g. "chinese tts comparison") usually match
+    # nothing and the provider silently returns []. Strip filler words first,
+    # then progressively drop trailing tokens until we get hits.
+    STOPWORDS = frozenset({
+        "a", "an", "the", "of", "for", "to", "in", "on", "and", "or", "with",
+        "best", "top", "good", "comparison", "compare", "vs", "versus", "how",
+        "what", "which", "review", "reviews", "list", "awesome", "tool", "tools",
+        "software", "app", "apps", "library", "libraries", "alternative",
+        "alternatives", "use", "using", "guide", "tutorial", "example", "examples",
+    })
+
+    def _keywords(self, query: str) -> str:
+        tokens = [t for t in query.split() if t]
+        kept = [t for t in tokens if t.lower().strip(".,!?;:") not in self.STOPWORDS]
+        return " ".join(kept)
+
+    def _run_gh(self, query: str, limit: int) -> list[dict[str, Any]]:
+        if not query.strip():
+            return []
         argv = [
-            "gh",
-            "search",
-            "repos",
-            query,
-            "--sort",
-            "stars",
-            "--limit",
-            str(limit),
-            "--json",
-            self.json_fields,
+            "gh", "search", "repos", query,
+            "--sort", "stars", "--limit", str(limit),
+            "--json", self.json_fields,
         ]
-        payload = self.runner(argv, self.timeout)
-        rows = json.loads(payload or "[]")
+        return json.loads(self.runner(argv, self.timeout) or "[]")
+
+    def _candidates(self, query: str) -> list[str]:
+        reduced = self._keywords(query)
+        candidates: list[str] = []
+        for cand in (reduced, query):
+            if cand and cand not in candidates:
+                candidates.append(cand)
+        tokens = reduced.split()
+        while len(tokens) > 1:
+            tokens = tokens[:-1]
+            cand = " ".join(tokens)
+            if cand not in candidates:
+                candidates.append(cand)
+        return candidates
+
+    def search(self, query: str, limit: int = 5) -> list[SearchResult]:
+        rows: list[dict[str, Any]] = []
+        for candidate in self._candidates(query):
+            rows = self._run_gh(candidate, limit)
+            if rows:
+                break
         results: list[SearchResult] = []
         for row in rows:
             full_name = row.get("fullName") or row.get("name") or "unknown"
@@ -361,6 +397,90 @@ class JinaReaderProvider:
         return results
 
 
+class RedFoxProvider:
+    """Opt-in adapter for redfox.hk Chinese-media data (公众号 / 小红书 / B站).
+
+    RedFox is a PAID source, so this provider never runs silently: it activates
+    only when ``REDFOX_API_KEY`` is set AND the caller explicitly opts in
+    (``--redfox`` on the CLI), honoring the skill's rule that paid providers
+    require confirmation. Endpoints reverse-engineered from
+    ``redfox.hk/story/web/api/doc/platform/<code>/interfaces``.
+    """
+
+    BASE = "https://redfox.hk/story/api"
+    # platform code -> (search endpoint, human label)
+    ENDPOINTS = {
+        "gzh": ("gzhData/searchArticle", "公众号"),
+        "xhs": ("xhsUser/searchArticle", "小红书"),
+        "bili": ("bili/data/workSearch", "B站"),
+    }
+    PLATFORM_HINTS = (
+        ("xhs", ("小红书", "xhs", "xiaohongshu", "红书")),
+        ("bili", ("b站", "bili", "哔哩", "bilibili")),
+        ("gzh", ("公众号", "gzh", "weixin", "微信")),
+    )
+
+    def __init__(self, api_key: str | None = None, timeout: int = 30):
+        self.api_key = api_key if api_key is not None else os.environ.get("REDFOX_API_KEY", "")
+        self.timeout = timeout
+
+    @classmethod
+    def detect_platform(cls, query: str) -> str:
+        lowered = query.lower()
+        for platform, hints in cls.PLATFORM_HINTS:
+            if any(h in lowered for h in hints):
+                return platform
+        return "gzh"
+
+    def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        import urllib.request
+
+        request = urllib.request.Request(
+            f"{self.BASE}/{path}",
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json", "REDFOX_API_KEY": self.api_key},
+        )
+        with urllib.request.urlopen(request, timeout=self.timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def search(self, query: str, platform: str | None = None, limit: int = 5) -> list[SearchResult]:
+        if not self.api_key:
+            raise ProviderError(
+                "REDFOX_API_KEY 未设置；RedFox 为付费源，需显式提供 key 后再用 --redfox 启用。"
+            )
+        platform = platform or self.detect_platform(query)
+        path, label = self.ENDPOINTS.get(platform, self.ENDPOINTS["gzh"])
+        if platform == "xhs":
+            payload = {"keyword": query, "offset": 0, "sortType": "default"}
+        elif platform == "bili":
+            payload = {"keyword": query}
+        else:
+            payload = {"keyword": query, "pageNum": 1, "pageSize": limit}
+        try:
+            data = (self._post(path, payload) or {}).get("data") or {}
+        except (OSError, ValueError) as exc:  # network / JSON errors
+            raise ProviderError(f"RedFox 调用失败：{exc}") from exc
+        rows = data.get("list") or []
+        results: list[SearchResult] = []
+        for row in rows[:limit]:
+            metrics = []
+            for key, lbl in (("readCount", "读"), ("likeCount", "赞"), ("commentCount", "评")):
+                if row.get(key) is not None:
+                    metrics.append(f"{lbl}{row[key]}")
+            results.append(
+                SearchResult(
+                    source=f"redfox:{platform}",
+                    title=row.get("title") or row.get("workTitle") or "",
+                    url=row.get("workUrl") or row.get("url") or "",
+                    snippet=compact_text(" · ".join(metrics)),
+                    published=row.get("publishTime"),
+                    meta={"platform": platform, "label": label},
+                )
+            )
+        return results
+
+
 class SuperSearch:
     def __init__(
         self,
@@ -368,14 +488,18 @@ class SuperSearch:
         github: GitHubProvider | None = None,
         exa: ExaProvider | None = None,
         jina: JinaReaderProvider | None = None,
+        redfox: RedFoxProvider | None = None,
+        use_redfox: bool = False,
     ):
         self.router = router or SearchRouter()
         self.github = github or GitHubProvider()
         self.exa = exa or ExaProvider()
         self.jina = jina or JinaReaderProvider()
+        self.redfox = redfox or RedFoxProvider()
+        self.use_redfox = use_redfox
 
     def search(self, query: str, mode: str = "auto", limit: int = 5) -> dict[str, Any]:
-        plan = self.router.plan(query, mode=mode)
+        plan = self.router.plan(query, mode=mode, use_redfox=self.use_redfox)
         notes = list(plan.notes)
         results: list[SearchResult] = []
 
@@ -384,9 +508,14 @@ class SuperSearch:
                 if provider == "jina_reader":
                     results.extend(self.jina.read_urls(plan.urls))
                 elif provider == "github":
-                    results.extend(self.github.search(query, limit=limit))
+                    gh_results = self.github.search(query, limit=limit)
+                    if not gh_results:
+                        notes.append("GitHub 未命中仓库（已尝试关键词降级与逐词回退）。")
+                    results.extend(gh_results)
                 elif provider == "exa":
                     results.extend(self.exa.search(query, limit=limit))
+                elif provider == "redfox":
+                    results.extend(self.redfox.search(query, limit=limit))
                 else:
                     notes.append(f"未识别 provider：{provider}")
             except (ProviderError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
@@ -439,6 +568,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, default=5)
     parser.add_argument("--format", choices=["markdown", "json"], default="markdown")
     parser.add_argument("--dry-run", action="store_true", help="Print the route plan without calling providers")
+    parser.add_argument(
+        "--redfox",
+        action="store_true",
+        help="Opt in to the RedFox paid source for Chinese-media queries (requires REDFOX_API_KEY)",
+    )
     return parser
 
 
@@ -448,9 +582,12 @@ def main(argv: list[str] | None = None) -> int:
     router = SearchRouter()
 
     if args.dry_run:
-        payload: dict[str, Any] = {"plan": router.plan(query, args.mode).to_dict(), "notes": [], "results": []}
+        plan = router.plan(query, args.mode, use_redfox=args.redfox)
+        payload: dict[str, Any] = {"plan": plan.to_dict(), "notes": list(plan.notes), "results": []}
     else:
-        payload = SuperSearch(router=router).search(query, mode=args.mode, limit=args.limit)
+        payload = SuperSearch(router=router, use_redfox=args.redfox).search(
+            query, mode=args.mode, limit=args.limit
+        )
 
     if args.format == "json":
         print(json.dumps(payload, ensure_ascii=False, indent=2))
